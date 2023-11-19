@@ -1,0 +1,232 @@
+import os
+import re
+import os.path
+import subprocess
+import sys
+import csv
+import time
+import select
+import paramiko
+import logging
+import threading
+import tarfile
+import psutil
+from scp import SCPClient
+from subprocess import Popen, PIPE
+
+class Utility:
+    def __init__(self, dname, usrname, passwd):
+        self.device_name = dname
+        self.uname = usrname
+        self.pwd = passwd
+        self.remote_conn = {}
+        self.ssh = {}
+        self.masData = {}
+        self.maxBufferSize = 99999999999
+
+        self.ssh = paramiko.SSHClient()
+        self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        self.ssh.connect(self.device_name, username=self.uname, password=self.pwd)
+        print ("*********************************************")
+        print ("Connected to %s" % self.device_name)
+        print ("*********************************************")
+        self.remote_conn = self.ssh.invoke_shell()
+        self.scp = SCPClient(self.ssh.get_transport(), sanitize=lambda x: x)
+        self.sftp = self.ssh.open_sftp()
+
+    # Command to retrieve the mac from server
+    def MacFinder(self):
+        output = ''
+        cmd = "ifconfig geneve0 | grep ether | awk '{ print $2 }'"
+        stdin, stdout, stderr = self.ssh.exec_command(cmd)
+        for line in iter(stdout.readline, ""):
+            print(line, end="")
+        stdout.channel.recv_exit_status()
+        time.sleep(5)
+        return line
+
+    # Download the pcaps to local path
+    def PcapCapture(self, pcap_path, dest_path='/homes/mpal/'):
+
+        output = ''
+        print ("*******Check for the tcpdump process*********")
+        cmd = "ps -e | pgrep tcpdump"
+        stdin, stdout, stderr = self.ssh.exec_command(cmd)
+        for line in iter(stdout.readline, ""):
+            print(line, end="")
+        stdout.channel.recv_exit_status()
+        print ("*********************************************")
+        time.sleep(2)
+        pid = line
+
+        output = ''
+        print ("******Kill any stale tcpdump process*********")
+        cmd = "kill -9 " + pid.strip()
+        self.remote_conn.send(cmd + "\n")
+        time.sleep(2)
+        output = self.remote_conn.recv(self.maxBufferSize)
+        output_str = output.decode('utf-8')
+        print(output_str)
+        print ("*********************************************")
+
+        try:
+            self.scp.get(pcap_path, dest_path)
+        except:
+            print ("Unsuccessful SCP")
+
+    # Capture debug logs
+    def debugCapture(self):
+        output = ''
+        cmd_list = ['lsof -i UDP ; lsof -i TCP',
+                    'dmesg',
+                    'ps -eaf | grep python3'
+                   ]
+        print ("*************** Interface and route coonfiguration **************************************")
+        for cmd in cmd_list:
+            output = ''
+            self.remote_conn.send(cmd + "\n")
+            time.sleep(5)
+            output = self.remote_conn.recv(self.maxBufferSize)
+            output_str = output.decode('utf-8')
+            print(output_str)
+            time.sleep(2)
+        print ("*****************************************************************************************")
+
+
+    # Kill process
+    def processKill(self):
+        output = ''
+        pidList = []
+        print ("*******Check for the python3 process*********")
+        cmd = "ps -e | pgrep python3"
+        stdin, stdout, stderr = self.ssh.exec_command(cmd)
+        for line in iter(stdout.readline, ""):
+            print(line, end="")
+            pidList.append(line.strip())
+        stdout.channel.recv_exit_status()
+        print ("*********************************************")
+        time.sleep(2)
+        print (pidList)
+
+        for elem in pidList:
+            print ("*******Kill any stale python3 process*********")
+            output = ''
+            cmd = "kill -9 " + elem
+            self.remote_conn.send(cmd + "\n")
+            time.sleep(2)
+            output = self.remote_conn.recv(self.maxBufferSize)
+            output_str = output.decode('utf-8')
+            print(output_str)
+            print ("**********************************************")
+
+    # Command to configure and start the Server
+    def ServerCommand(self, srvr_port):
+
+        self.processKill()
+        output = ''
+        cmd_list = ['ifconfig eth1 down ; ifconfig geneve0 down',
+                    'ifconfig eth1 66.66.66.2 netmask 255.255.255.0',
+                    'ifconfig eth1 inet6 add 66:66:66::2/96',
+                    'route -A inet6 add 55:55:55::/96 gateway 66:66:66::1',
+                    'route add -net 55.55.55.0/24 gw 66.66.66.1',
+                    'ifconfig',
+                    'tcpdump -i eth1 -s 60000 -w /var/tmp/Server.pcap &'
+                   ]
+
+        print ("*************** Interface and route coonfiguration **************************************")
+        for cmd in cmd_list:
+            output = ''
+            self.remote_conn.send(cmd + "\n")
+            time.sleep(5)
+            output = self.remote_conn.recv(self.maxBufferSize)
+            output_str = output.decode('utf-8')
+            print(output_str)
+            time.sleep(2)
+        print ("*****************************************************************************************")
+
+        print ("************************* Capture debugging data before Ligen server starting ***********")
+        self.debugCapture()
+        print ("*****************************************************************************************")
+
+        time.sleep(5)
+        cmd1 = "cd /home/regress/ligen/ ;"
+        cmd2 = " ./linux_trafficgen_servers_start_cli.py -t HttpStateful -i 22:22:22::2 -d 11:11:11::2 -o DEBUG -p " + srvr_port + " -F \"geneve=True,remote_ip='55:55:55::2',vni='200'\" &"
+        cmd = cmd1 + cmd2
+        print (cmd)
+        self.remote_conn.send(cmd + "\n")
+        time.sleep(5)
+        output = self.remote_conn.recv(self.maxBufferSize)
+        output_str = output.decode('utf-8')
+        print(output_str)
+
+        print ("****************** Capture debugging data after Ligen server starting *******************")
+        self.debugCapture()
+        print ("*****************************************************************************************")
+
+    # Command to configure and start the Client
+    def ClientCommand(self, destmac, clnt_port, srvr_port):
+
+        output = ''
+        cmd_list = ['ifconfig eth1 down ; ifconfig geneve0 down',
+                    'ifconfig eth1 55.55.55.2 netmask 255.255.255.0',
+                    'ifconfig eth1 inet6 add 55:55:55::2/96',
+                    'route -A inet6 add 66:66:66::/96 gateway 55:55:55::1',
+                    'route add -net 66.66.66.0/24 gw 55.55.55.1',
+                    'ifconfig',
+                    'tcpdump -i eth1 -s 60000 -w /var/tmp/Client.pcap &'
+                   ]
+        print ("*************** Interface and route coonfiguration **************************************")
+        for cmd in cmd_list:
+            output = ''
+            self.remote_conn.send(cmd + "\n")
+            time.sleep(5)
+            output = self.remote_conn.recv(self.maxBufferSize)
+            output_str = output.decode('utf-8')
+            print(output_str)
+            time.sleep(2)
+        print ("*****************************************************************************************")
+
+        time.sleep(5)
+        cmd1 = "cd /home/regress/ligen/ ;"
+        cmd2 = "./linux_trafficgen_clients_start_cli.py -d 22:22:22::2 -s 11:11:11::2 -t HttpStateful -o DEBUG -p " + srvr_port + " -n 10s -P " + clnt_port + " -F \"geneve=True,remote_ip='66:66:66::2',vni='200',inner_dest_mac='" + destmac.strip() + "'\" -S 1 -c 1 -o DEBUG -n 10s"
+        cmd = cmd1 + cmd2
+        print (cmd)
+        stdin, stdout, stderr = self.ssh.exec_command(cmd + "\n", get_pty=True)
+        for line in iter(stdout.readline, ""):
+            print(line, end="")
+        #stdout.channel.recv_exit_status()
+        #time.sleep(5)
+
+# Test code
+clnt_obj = Utility("10.52.205.163", "root", "Embe1mpls")
+srvr_obj = Utility("10.52.215.94", "root", "Embe1mpls")
+
+for i in range(4010,4011):
+    print ("##########################################################")
+    print ("            STARTING OF EXEC                              ")
+    print ("##########################################################")
+    #print ("Input the server port:")
+    #srvr_port = input()
+    srvr_port = str(i)
+    clnt_port = int(srvr_port) + 100
+    print ("Client port:",clnt_port)
+
+    srvr_obj.ServerCommand(srvr_port)
+    mac_addr = srvr_obj.MacFinder()
+    print ("Geneve server mac address:", mac_addr)
+    clnt_obj.ClientCommand(mac_addr, str(clnt_port), srvr_port)
+
+    #input("Press the Enter key to finish the script: ")
+    time.sleep(5)
+    currentDir = os.getcwd()
+    print ("Current working directory:", currentDir)
+    clnt_obj.PcapCapture("/var/tmp/Client.pcap", dest_path=currentDir)
+    srvr_obj.PcapCapture("/var/tmp/Server.pcap", dest_path=currentDir)
+    clnt_obj.processKill()
+    srvr_obj.processKill()
+    os.rename('Client.pcap', 'Client_' + str(i) + ".pcap")
+    os.rename('Server.pcap', 'Server_' + str(i) + ".pcap")
+
+    print ("##########################################################")
+    print ("            ENDING OF EXEC                                ")
+    print ("##########################################################")
